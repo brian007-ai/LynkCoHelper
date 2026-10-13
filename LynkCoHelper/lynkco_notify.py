@@ -1,16 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-Bark 推送通知工具模块，提供两个通用能力（不含任何业务逻辑，供
-lynkco_daily_tasks.py 按需调用）：
-    - build_markdown_report(result)：把任务结果字典组装成 Bark Markdown 文案；
-    - send_bark_notification(...)：把一段 Markdown 文案推送到 Bark。
+推送通知工具模块，提供以下通用能力（不含任何业务逻辑，供
+lynkco_daily_tasks.py / lynkco_comment.py 按需调用）：
+    - build_markdown_report(result)：把任务结果字典组装成推送文案；
+    - send_feishu_notification(...)：把文案通过飞书群机器人推送出去
+      （每日签到/分享任务使用）；
+    - send_bark_notification(...)：把文案推送到 iOS Bark（图文评论任务
+      使用，逐条携带文章跳转链接）。
 
-配置方式：环境变量 LYNKCO_BARK_KEY，或 env.json 的 notify.barkKey 字段
-（Bark App「我的」页面可查看），未配置时跳过推送并打印提示，不抛异常。
+飞书配置：环境变量 LYNKCO_FEISHU_WEBHOOK（群机器人的完整 webhook 地址，
+形如 https://open.feishu.cn/open-apis/bot/v2/hook/xxxx），或 env.json 的
+notify.feishuWebhook 字段。若机器人开启了签名校验，额外配置
+LYNKCO_FEISHU_SECRET（机器人安全设置页的加签密钥）。未配置 webhook 时
+跳过推送并打印提示，不抛异常。
 """
+import base64
+import hashlib
+import hmac
+import time
+
 import requests
 
 from lynkco_common import env_value, load_env_data
+
+FEISHU_CONNECT_TIMEOUT = 5
+FEISHU_READ_TIMEOUT = 15
 
 BARK_DEFAULT_BASE = "https://api.day.app"
 BARK_CONNECT_TIMEOUT = 5
@@ -23,10 +37,7 @@ def _extract_point(energy_resp: dict) -> str:
 
 
 def build_markdown_report(result: dict) -> str:
-    """
-    把 lynkco_daily_tasks.run_daily_tasks() 返回的结果字典组装成一段
-    Bark markdown 推送内容。
-    """
+    """把 lynkco_daily_tasks.run_daily_tasks() 返回的结果字典组装成推送文案。"""
     lines = []
 
     # --- 签到 ---
@@ -81,11 +92,85 @@ def build_markdown_report(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _to_feishu_lark_md(markdown_body: str) -> str:
+    """
+    飞书 lark_md 不支持 ### 一级标题语法（会原样显示井号），这里把标题行
+    转成加粗行，其余加粗/列表符号 lark_md 均可直接渲染。
+    """
+    out_lines = []
+    for line in markdown_body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("### "):
+            out_lines.append(f"**{stripped[4:].strip()}**")
+        else:
+            out_lines.append(line)
+    return "\n".join(out_lines)
+
+
+def _build_sign(timestamp: int, secret: str) -> str:
+    """飞书群机器人加签：HMAC-SHA256(f"{timestamp}\\n{secret}") 后 base64。"""
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(string_to_sign.encode("utf-8"), digestmod=hashlib.sha256).digest()
+    return base64.b64encode(hmac_code).decode("utf-8")
+
+
+def send_feishu_notification(title: str, markdown_body: str,
+                             webhook: str = None, secret: str = None) -> dict:
+    """
+    通过飞书群机器人发送一条卡片消息（lark_md 富文本，可显示签到/分享/
+    积分明细）。webhook 不传则读取环境变量 LYNKCO_FEISHU_WEBHOOK，未配置
+    时返回 {"skipped": True} 且不抛异常。
+    """
+    webhook = (webhook or env_value("LYNKCO_FEISHU_WEBHOOK")
+               or load_env_data().get("notify", {}).get("feishuWebhook", "").strip())
+    if not webhook:
+        print("[提示] 未配置 LYNKCO_FEISHU_WEBHOOK，跳过飞书推送。")
+        return {"skipped": True}
+
+    secret = secret or env_value("LYNKCO_FEISHU_SECRET")
+
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": "blue",
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": _to_feishu_lark_md(markdown_body)},
+                }
+            ],
+        },
+    }
+    if secret:
+        timestamp = int(time.time())
+        payload["timestamp"] = str(timestamp)
+        payload["sign"] = _build_sign(timestamp, secret)
+
+    # 飞书 webhook 直连可达，用干净 session 避免继承桌面级代理导致请求挂死。
+    session = requests.Session()
+    session.trust_env = False
+    resp = session.post(
+        webhook, json=payload,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        timeout=(FEISHU_CONNECT_TIMEOUT, FEISHU_READ_TIMEOUT),
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    # 飞书成功返回 {"code":0,"StatusCode":0,...}，失败时 code/StatusCode 非 0。
+    if data.get("code") not in (0, None) or data.get("StatusCode") not in (0, None):
+        raise RuntimeError(f"飞书机器人返回错误: {data}")
+    return data
+
+
 def send_bark_notification(title: str, markdown_body: str, group: str = "LynkCo签到",
                             icon: str = None, level: str = "active",
                             bark_key: str = None, open_url: str = None) -> dict:
     """
-    通过 Bark 发送一条 Markdown 格式的推送通知。level 可选
+    通过 Bark 发送一条 Markdown 格式的推送通知（图文评论任务使用，逐条
+    携带文章跳转链接）。level 可选
     "critical"/"active"/"timeSensitive"/"passive"。bark_key 不传则读取
     环境变量 LYNKCO_BARK_KEY，未配置时返回 {"skipped": True} 且不抛异常。
     """
