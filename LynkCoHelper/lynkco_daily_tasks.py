@@ -119,12 +119,22 @@ def run_and_notify() -> dict:
 
 def main():
     try:
-        run_and_notify()
+        result = run_and_notify()
     except RuntimeError as e:
         print(f"[错误] {e}")
         sys.exit(1)
     except Exception as e:
         print(f"[错误] 执行失败: {e}")
+        sys.exit(1)
+
+    # 签到或分享失败时也以非零状态退出，供 CI（daily-tasks.yml）识别并重试。
+    # 今日已签到时 sign_result 为 None，不算失败；分享失败用 ok 字段判断。
+    sign_result = result.get("sign_result") or {}
+    sign_failed = (not result.get("already_signed")) and not sign_result.get("success")
+    share_result = result.get("share_result")
+    share_failed = share_result is not None and not share_result.get("ok")
+    if sign_failed or share_failed:
+        print("[错误] 存在失败项（签到/分享），以非零状态退出供 CI 重试")
         sys.exit(1)
 
 

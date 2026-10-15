@@ -7,21 +7,44 @@
 #   - LYNKCO_APP_SECRETS 是领克官方 App 的应用级共用签名密钥集合
 #     （非个人账号凭证），一个 JSON 字符串 Secret 整合以下 4 个独立字段，
 #     必须配置，否则脚本无法计算请求签名。
+#   - 首次执行失败会自动重试 2 次（attempt 2/3）；三次均失败时推送一条
+#     飞书告警并让 job 标红。注意：GitHub schedule 被丢弃（根本没跑）时
+#     平台内无法感知，如需兜底请用外部定时任务调 GitHub API 检查/触发。
 
 name: LynkCoHelperRunner
 
 on:
   schedule:
-    # 每天 UTC 1:00（北京时间 9:00）执行，GitHub 调度有延迟（可能延后数分钟到
-    # 数小时）。需要精确触发可用 iOS 快捷指令等定时调用 GitHub API 主动触发
-    # （注意：API 路径中的 workflow 文件名需与本文件名保持一致）。
-    - cron: "0 1 * * *"
+    # 每天 UTC 17:15（北京时间次日凌晨 1:15）执行。特意避开整点（GitHub
+    # 整点为高负载时段，调度延迟与丢弃率明显更高）。GitHub 调度仍可能有
+    # 延迟（延后数分钟到数小时）。需要精确触发可用 iOS 快捷指令等定时
+    # 调用 GitHub API 主动触发（注意：API 路径中的 workflow 文件名需与
+    # 本文件名保持一致）。
+    - cron: "15 17 * * *"
   workflow_dispatch:
 
 jobs:
   daily-tasks:
 
     runs-on: ubuntu-latest
+
+    env:
+      # refreshToken 自动续期获取 token，详见 lynkco_login.load_token()
+      LYNKCO_REFRESH_TOKEN: ${{ secrets.LYNKCO_REFRESH_TOKEN }}
+      LYNKCO_DEVICE_ID: ${{ secrets.LYNKCO_DEVICE_ID }}
+      # 飞书群机器人推送，详见 lynkco_notify.py：
+      # LYNKCO_FEISHU_WEBHOOK 是群机器人的完整 webhook 地址
+      # （https://open.feishu.cn/open-apis/bot/v2/hook/xxxx）；
+      # LYNKCO_FEISHU_SECRET 仅在机器人开启“加签”安全校验时需要。
+      LYNKCO_FEISHU_WEBHOOK: ${{ secrets.LYNKCO_FEISHU_WEBHOOK }}
+      LYNKCO_FEISHU_SECRET: ${{ secrets.LYNKCO_FEISHU_SECRET }}
+      # App 共用签名密钥集合（JSON 字符串，详见 lynkco_common.py），必须配置，
+      # 否则脚本会在计算签名时报错退出。字段名与 env.json 的 secrets 段一致：
+      # {"nativeAppKey":"","nativeAppSecret":"","nativeAppCode":"",
+      #  "loginAppCode":""}
+      LYNKCO_APP_SECRETS: ${{ secrets.LYNKCO_APP_SECRETS }}
+      LYNKCO_TIMEOUT: ${{ vars.LYNKCO_TIMEOUT || '30' }}
+      LYNKCO_RETRIES: ${{ vars.LYNKCO_RETRIES || '2' }}
 
     steps:
     - name: CheckOut
@@ -34,23 +57,44 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         if [ -f ./LynkCoHelper/requirements.txt ]; then pip install -r ./LynkCoHelper/requirements.txt; fi
-    - name: Run sign-in and notify
-      env:
-        # refreshToken 自动续期获取 token，详见 lynkco_login.load_token()
-        LYNKCO_REFRESH_TOKEN: ${{ secrets.LYNKCO_REFRESH_TOKEN }}
-        LYNKCO_DEVICE_ID: ${{ secrets.LYNKCO_DEVICE_ID }}
-        # 飞书群机器人推送，详见 lynkco_notify.py：
-        # LYNKCO_FEISHU_WEBHOOK 是群机器人的完整 webhook 地址
-        # （https://open.feishu.cn/open-apis/bot/v2/hook/xxxx）；
-        # LYNKCO_FEISHU_SECRET 仅在机器人开启“加签”安全校验时需要。
-        LYNKCO_FEISHU_WEBHOOK: ${{ secrets.LYNKCO_FEISHU_WEBHOOK }}
-        LYNKCO_FEISHU_SECRET: ${{ secrets.LYNKCO_FEISHU_SECRET }}
-        # App 共用签名密钥集合（JSON 字符串，详见 lynkco_common.py），必须配置，
-        # 否则脚本会在计算签名时报错退出。字段名与 env.json 的 secrets 段一致：
-        # {"nativeAppKey":"","nativeAppSecret":"","nativeAppCode":"",
-        #  "loginAppCode":""}
-        LYNKCO_APP_SECRETS: ${{ secrets.LYNKCO_APP_SECRETS }}
-        LYNKCO_TIMEOUT: ${{ vars.LYNKCO_TIMEOUT || '30' }}
-        LYNKCO_RETRIES: ${{ vars.LYNKCO_RETRIES || '2' }}
+    - name: Run sign-in and notify (attempt 1)
+      id: run1
+      continue-on-error: true
       run: |
         python ./LynkCoHelper/lynkco_daily_tasks.py
+    - name: Retry if failed (attempt 2)
+      id: run2
+      if: steps.run1.outcome == 'failure'
+      continue-on-error: true
+      run: |
+        python ./LynkCoHelper/lynkco_daily_tasks.py
+    - name: Retry if failed (attempt 3)
+      id: run3
+      if: steps.run2.outcome == 'failure'
+      continue-on-error: true
+      run: |
+        python ./LynkCoHelper/lynkco_daily_tasks.py
+    - name: Alert failure to Feishu
+      # 三次均失败才告警；本步骤失败（如飞书不可达）不影响 job 结论。
+      if: steps.run3.outcome == 'failure'
+      continue-on-error: true
+      working-directory: ./LynkCoHelper
+      run: |
+        python - <<'PYEOF'
+        from datetime import datetime
+
+        from lynkco_notify import send_feishu_notification
+
+        send_feishu_notification(
+            "领克App · 任务失败告警",
+            "**今日定时任务三次执行均失败**\n"
+            f"- 时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}（UTC）\n"
+            "- 可能原因：refreshToken 过期 / 网络异常 / 接口变更\n"
+            "- 排查日志：https://github.com/brian007-ai/LynkCoHelper/actions",
+        )
+        PYEOF
+    - name: Mark job failed
+      # 告警发出后仍把 job 标红，Actions 列表里一眼可见。
+      if: steps.run3.outcome == 'failure'
+      run: |
+        exit 1
