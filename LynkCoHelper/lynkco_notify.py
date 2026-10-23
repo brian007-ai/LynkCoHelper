@@ -63,9 +63,12 @@ def _sign_reward_parts(sign_data: dict) -> list:
 
 def _task_progress_lines(task_resp) -> list:
     """
-    解析 getTaskList 响应为进度行（字段语义参考 yujiejobs/lynk_sign_docker：
-    data 为任务列表，taskProcess 为已签天数，总天数从 taskName 的 "X天" 中
-    正则提取，rewardContent 为奖励列表）。
+    解析 getTaskList 响应为进度行：data 为任务列表，总天数从 taskName 的
+    "X天" 中正则提取，rewardContent 为奖励列表。
+
+    taskProcess 是「剩余天数」而非已签天数（2026-10-23 真实推送数据证实：
+    本月度25天任务 taskProcess=2，而本月 23 天均已签到；本季度85天任务
+    taskProcess=62，恰为 85-23）。故 已签 = 总天数 - taskProcess。
     """
     if not isinstance(task_resp, dict):
         return []
@@ -78,10 +81,12 @@ def _task_progress_lines(task_resp) -> list:
             continue
         tname = str(t.get("taskName", "?"))
         tproc = t.get("taskProcess")
+        tproc_str = str(tproc).strip() if tproc is not None else ""
         reward = ", ".join(t.get("rewardContent") or []) or "无奖励字段"
         matched = re.search(r"(\d+)天", tname)
-        if matched and str(tproc or "").isdigit():
-            display = f"已签 {tproc} / {matched.group(1)} 天"
+        if matched and tproc_str.isdigit():
+            total = int(matched.group(1))
+            display = f"已签 {total - int(tproc_str)} / {total} 天"
         else:
             display = f"进度 {tproc}"
         lines.append(f"- {tname}：`{display}`（{reward}）")
