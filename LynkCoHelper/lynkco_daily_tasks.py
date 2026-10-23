@@ -26,6 +26,8 @@ from lynkco_share import LynkCoShareClient
 ENERGY_REFRESH_DELAY_SECONDS = float(env_value("LYNKCO_ENERGY_DELAY", "5"))
 
 EP_MY_ENERGY = "/app/energy/myEnergy"
+# 能量体/成长等级接口（与 myEnergy 同网关同签名体系，返回 data.accountLevelVo）
+EP_ENERGY_GROWTH = "/app/energy/my/growth"
 
 
 def get_my_energy(client: LynkCoSignClient) -> dict:
@@ -34,11 +36,17 @@ def get_my_energy(client: LynkCoSignClient) -> dict:
     return resp.json()
 
 
+def get_my_energy_growth(client: LynkCoSignClient) -> dict:
+    """查询当前账号的能量体/成长等级（GET /app/energy/my/growth，data.accountLevelVo）。"""
+    resp = client._request("GET", EP_ENERGY_GROWTH)
+    return resp.json()
+
+
 def run_daily_tasks(token: str, do_share: bool = True) -> dict:
     """
     编排执行一次完整的"签到 + 分享"流程，返回汇总结果字典：
     {"energy_before", "day_info", "already_signed", "sign_result", "continue_info",
-     "share_result", "energy_after"}（已签到/do_share=False 时对应字段为 None）。
+     "share_result", "energy_after", "energy_growth"}（已签到/do_share=False 时对应字段为 None）。
 
     do_share 默认 True，供需要在测试/脚本中跳过分享的调用方使用；
     正式入口 run_and_notify() 始终以 do_share=True 调用。
@@ -75,6 +83,13 @@ def run_daily_tasks(token: str, do_share: bool = True) -> dict:
     if not already_signed or (do_share and (result.get("share_result") or {}).get("ok")):
         time.sleep(ENERGY_REFRESH_DELAY_SECONDS)
     result["energy_after"] = get_my_energy(sign_client)
+
+    # 能量体（成长等级）与积分是两套体系，来自独立接口；查询失败不影响主流程。
+    try:
+        result["energy_growth"] = get_my_energy_growth(sign_client)
+    except Exception as e:
+        print(f"[警告] 能量体查询失败（不影响签到/分享）: {e}")
+        result["energy_growth"] = None
 
     return result
 

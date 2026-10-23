@@ -99,6 +99,18 @@ def build_markdown_report(result: dict) -> str:
     if expire_point != "?":
         lines.append(f"- 即将过期：**{expire_point}**")
 
+    # --- 能量体（成长等级，独立于积分的另一套数值） ---
+    growth_resp = result.get("energy_growth") or {}
+    level = (growth_resp.get("data") or {}).get("accountLevelVo") or {}
+    growth_value = level.get("growth")
+    if growth_value is not None:
+        lines.append("\n### ⚡ 能量体")
+        line = f"- 当前能量体：**{growth_value}**"
+        level_name = level.get("name")
+        if level_name:
+            line += f"（{level_name}）"
+        lines.append(line)
+
     return "\n".join(lines)
 
 
