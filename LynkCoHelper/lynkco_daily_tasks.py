@@ -16,8 +16,8 @@ import sys
 import time
 
 from lynkco_common import env_value, mask_sensitive
-from lynkco_login import load_token
-from lynkco_notify import build_markdown_report, send_feishu_notification
+from lynkco_login import load_token, get_last_refresh_info
+from lynkco_notify import build_markdown_report, build_feishu_card, send_feishu_notification
 from lynkco_sign import LynkCoSignClient
 from lynkco_share import LynkCoShareClient
 
@@ -28,6 +28,8 @@ ENERGY_REFRESH_DELAY_SECONDS = float(env_value("LYNKCO_ENERGY_DELAY", "5"))
 EP_MY_ENERGY = "/app/energy/myEnergy"
 # 能量体/成长等级接口（与 myEnergy 同网关同签名体系，返回 data.accountLevelVo）
 EP_ENERGY_GROWTH = "/app/energy/my/growth"
+# 签到任务进度接口（连续7天/月度/季度/年度，data 为任务列表）
+EP_TASK_LIST = "/up/api/v1/userReward/getTaskList"
 
 
 def get_my_energy(client: LynkCoSignClient) -> dict:
@@ -39,6 +41,12 @@ def get_my_energy(client: LynkCoSignClient) -> dict:
 def get_my_energy_growth(client: LynkCoSignClient) -> dict:
     """查询当前账号的能量体/成长等级（GET /app/energy/my/growth，data.accountLevelVo）。"""
     resp = client._request("GET", EP_ENERGY_GROWTH)
+    return resp.json()
+
+
+def get_task_list(client: LynkCoSignClient) -> dict:
+    """查询签到任务进度（GET /up/api/v1/userReward/getTaskList，data 为任务列表）。"""
+    resp = client._request("GET", EP_TASK_LIST)
     return resp.json()
 
 
@@ -91,6 +99,13 @@ def run_daily_tasks(token: str, do_share: bool = True) -> dict:
         print(f"[警告] 能量体查询失败（不影响签到/分享）: {e}")
         result["energy_growth"] = None
 
+    # 签到任务进度（连续7天/月度/季度/年度），查询失败不影响主流程。
+    try:
+        result["task_list"] = get_task_list(sign_client)
+    except Exception as e:
+        print(f"[警告] 任务进度查询失败（不影响签到/分享）: {e}")
+        result["task_list"] = None
+
     return result
 
 
@@ -109,16 +124,21 @@ def run_and_notify() -> dict:
 
     print("=== 执行每日任务（签到+分享）===")
     result = run_daily_tasks(token, do_share=True)
+    # CI 每次运行都会用 refreshToken 续期，此处 附上续期返回的过期时间，
+    # 供推送卡片展示 refreshToken 剩余天数；命中缓存 token 时为空字典。
+    result["token_info"] = get_last_refresh_info()
     print(json.dumps(mask_sensitive(result), ensure_ascii=False, indent=2))
 
     markdown_body = build_markdown_report(result)
     print("\n=== 推送内容预览 ===")
     print(markdown_body)
 
+    feishu_card = build_feishu_card(result)
     try:
         notify_result = send_feishu_notification(
             title="领克App · 每日任务",
             markdown_body=markdown_body,
+            card=feishu_card,
         )
     except Exception as e:
         # 推送失败（网络问题/代理超时等）不应影响签到/分享本身已经成功执行

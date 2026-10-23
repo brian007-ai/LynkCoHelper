@@ -365,6 +365,15 @@ def login_with_geetest_and_sms(mobile: str, verification_code: str,
 # 本地缓存的 token 距过期时间小于该阈值(秒)时视为已失效，提前触发续期，避免请求发出后 token 恰好过期。
 TOKEN_CACHE_SAFETY_MARGIN_SEC = 60
 
+# 最近一次 refreshToken 续期携带的过期时间戳（毫秒纪元）。只存 expireAt /
+# refreshExpireAt，不存 token 本身，避免敏感凭证经结果字典外泄到推送文案。
+_LAST_REFRESH_INFO: dict = {}
+
+
+def get_last_refresh_info() -> dict:
+    """返回最近一次 refreshToken 续期的时间信息 {"expireAt", "refreshExpireAt"}的副本；未发生过续期（命中缓存 token/静态 token）时返回空字典。"""
+    return dict(_LAST_REFRESH_INFO)
+
 
 def _cached_token_valid(user_data: dict) -> str:
     """若 env.json 中缓存的 token 距 tokenExpireAt 仍有余量，返回该 token；已过期/缺失时返回空字符串。"""
@@ -406,6 +415,11 @@ def load_token() -> str:
             refreshed = refresh_token(refresh_token_value.strip(), device_id.strip())
             print("[信息] 已使用 refreshToken 自动续期获取最新 token。")
             _save_refreshed_token(refreshed)
+            global _LAST_REFRESH_INFO
+            _LAST_REFRESH_INFO = {
+                "expireAt": refreshed.get("expireAt"),
+                "refreshExpireAt": refreshed.get("refreshExpireAt"),
+            }
             return refreshed["token"]
         except Exception as e:
             print(f"[警告] refreshToken 自动续期失败: {e}，将退回使用静态 token。")
