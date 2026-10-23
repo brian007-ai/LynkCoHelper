@@ -36,6 +36,11 @@ def _extract_point(energy_resp: dict) -> str:
     return str((energy_resp.get("data") or {}).get("point", "?"))
 
 
+def _extract_expire(energy_resp: dict) -> str:
+    """从 myEnergy 响应中安全地取出 expirePoint（即将过期积分）字段，取不到时返回 '?'。"""
+    return str((energy_resp.get("data") or {}).get("expirePoint", "?"))
+
+
 def build_markdown_report(result: dict) -> str:
     """把 lynkco_daily_tasks.run_daily_tasks() 返回的结果字典组装成推送文案。"""
     lines = []
@@ -60,20 +65,21 @@ def build_markdown_report(result: dict) -> str:
     continue_data = (result.get("continue_info") or {}).get("data") or {}
     continue_days = continue_data.get("continueDays")
     sign_card = continue_data.get("signCardNumber")
+    stats = []
     if continue_days is not None:
-        lines.append(f"- 连续签到：**{continue_days} 天**")
+        stats.append(f"连续签到 **{continue_days} 天**")
     if sign_card is not None:
-        lines.append(f"- 签到卡剩余：**{sign_card} 张**")
+        stats.append(f"签到卡剩余 **{sign_card} 张**")
+    if stats:
+        lines.append("- " + " · ".join(stats))
 
     # --- 分享 ---
     share_result = result.get("share_result")
     if share_result is not None:
         lines.append("\n### 🔗 分享任务")
         if share_result.get("ok"):
-            lines.append("- 状态：**上报成功**")
             article_title = share_result.get("articleTitle")
-            if article_title:
-                lines.append(f"- 分享文章：{article_title}")
+            lines.append("- 状态：**上报成功**" + (f"（{article_title}）" if article_title else ""))
         else:
             detail = share_result.get("detail") or {}
             lines.append(f"- 状态：**失败**（{detail.get('message', '详情见日志')}）")
@@ -88,6 +94,10 @@ def build_markdown_report(result: dict) -> str:
     except (ValueError, TypeError):
         delta_str = ""
     lines.append(f"- {point_before} → **{point_after}** {delta_str}".rstrip())
+
+    expire_point = _extract_expire(result.get("energy_after") or {})
+    if expire_point != "?":
+        lines.append(f"- 即将过期：**{expire_point}**")
 
     return "\n".join(lines)
 
