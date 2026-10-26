@@ -53,8 +53,9 @@ def get_task_list(client: LynkCoSignClient) -> dict:
 def run_daily_tasks(token: str, do_share: bool = True) -> dict:
     """
     编排执行一次完整的"签到 + 分享"流程，返回汇总结果字典：
-    {"energy_before", "day_info", "already_signed", "sign_result", "continue_info",
-     "share_result", "energy_after", "energy_growth"}（已签到/do_share=False 时对应字段为 None）。
+    {"energy_before", "energy_growth_before", "day_info", "already_signed", "sign_result",
+     "continue_info", "share_result", "energy_after", "energy_growth", "task_list"}（已签到/
+    do_share=False 时对应字段为 None）。
 
     do_share 默认 True，供需要在测试/脚本中跳过分享的调用方使用；
     正式入口 run_and_notify() 始终以 do_share=True 调用。
@@ -64,6 +65,13 @@ def run_daily_tasks(token: str, do_share: bool = True) -> dict:
     sign_client = LynkCoSignClient(token)
 
     result["energy_before"] = get_my_energy(sign_client)
+
+    # 能量体的签到前数值必须在签到前采集，否则无法在推送里展示真实变化；失败不影响主流程。
+    try:
+        result["energy_growth_before"] = get_my_energy_growth(sign_client)
+    except Exception as e:
+        print(f"[警告] 签到前能量体查询失败（不影响签到/分享）: {e}")
+        result["energy_growth_before"] = None
 
     day_info = sign_client.get_sign_day_info()
     result["day_info"] = day_info

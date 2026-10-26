@@ -42,6 +42,54 @@ def _extract_expire(energy_resp: dict) -> str:
     return str((energy_resp.get("data") or {}).get("expirePoint", "?"))
 
 
+def _extract_growth(growth_resp: dict):
+    """从 my/growth 响应中取出 (能量体数值, 等级名)，取不到时对应位置为 None。"""
+    level = ((growth_resp or {}).get("data") or {}).get("accountLevelVo") or {}
+    return level.get("growth"), level.get("name")
+
+
+def _format_change(before: str, after: str, with_arrow: bool) -> str:
+    """
+    把签到前后的数值渲染成对比文案：签到发生时显示 "旧值 → **新值**"，
+    已签到（对比无意义）或旧值缺失时只显示当前值。
+    """
+    if after == "?":
+        return "?"
+    if with_arrow and before != "?":
+        return f"{before} → **{after}**"
+    return f"**{after}**"
+
+
+def _account_metric_lines(result: dict) -> list:
+    """
+    账户三项数值（Co积分余额 / 能量体 / 即将过期积分），有签到动作时按
+    "签到前 → 签到后" 展示真实变化，已签到时只展示当前值。
+    """
+    with_arrow = (not result.get("already_signed")) and result.get("sign_result") is not None
+    lines = []
+
+    point_before = _extract_point(result.get("energy_before") or {})
+    point_after = _extract_point(result.get("energy_after") or {})
+    if point_after != "?":
+        lines.append("Co积分余额：" + _format_change(point_before, point_after, with_arrow))
+
+    growth_before, _ = _extract_growth(result.get("energy_growth_before"))
+    growth_after, level_name = _extract_growth(result.get("energy_growth"))
+    if growth_after is not None:
+        text = _format_change(str(growth_before if growth_before is not None else "?"),
+                              str(growth_after), with_arrow)
+        if level_name:
+            text += f"（{level_name}）"
+        lines.append("能量体：" + text)
+
+    expire_before = _extract_expire(result.get("energy_before") or {})
+    expire_after = _extract_expire(result.get("energy_after") or {})
+    if expire_after != "?":
+        lines.append("即将过期积分：" + _format_change(expire_before, expire_after, with_arrow))
+
+    return lines
+
+
 def _sign_reward_parts(sign_data: dict) -> list:
     """
     签到奖励细分（字段名来自领克签到响应，参考 yujiejobs/lynk_sign_docker）：
@@ -86,7 +134,10 @@ def _task_progress_lines(task_resp) -> list:
         matched = re.search(r"(\d+)天", tname)
         if matched and tproc_str.isdigit():
             total = int(matched.group(1))
-            display = f"已签 {total - int(tproc_str)} / {total} 天"
+            remain = int(tproc_str)
+            done = total - remain
+            display = (f"已签 {done} / {total} 天（已完成）" if remain <= 0
+                       else f"已签 {done} / {total} 天，还差 {remain} 天")
         else:
             display = f"进度 {tproc}"
         lines.append(f"- {tname}：`{display}`（{reward}）")
@@ -135,7 +186,7 @@ def build_markdown_report(result: dict) -> str:
     if continue_days is not None:
         stats.append(f"连续签到 **{continue_days} 天**")
     if sign_card is not None:
-        stats.append(f"签到卡剩余 **{sign_card} 张**")
+        stats.append(f"补签卡 **{sign_card} 张**")
     if stats:
         lines.append("- " + " · ".join(stats))
 
@@ -150,32 +201,11 @@ def build_markdown_report(result: dict) -> str:
             detail = share_result.get("detail") or {}
             lines.append(f"- 状态：**失败**（{detail.get('message', '详情见日志')}）")
 
-    # --- 积分变化 ---
-    point_before = _extract_point(result.get("energy_before") or {})
-    point_after = _extract_point(result.get("energy_after") or {})
-    lines.append("\n### 💰 积分变化")
-    try:
-        delta = int(point_after) - int(point_before)
-        delta_str = f"（+{delta}）" if delta > 0 else (f"（{delta}）" if delta < 0 else "（无变化）")
-    except (ValueError, TypeError):
-        delta_str = ""
-    lines.append(f"- {point_before} → **{point_after}** {delta_str}".rstrip())
-
-    expire_point = _extract_expire(result.get("energy_after") or {})
-    if expire_point != "?":
-        lines.append(f"- 即将过期：**{expire_point}**")
-
-    # --- 能量体（成长等级，独立于积分的另一套数值） ---
-    growth_resp = result.get("energy_growth") or {}
-    level = (growth_resp.get("data") or {}).get("accountLevelVo") or {}
-    growth_value = level.get("growth")
-    if growth_value is not None:
-        lines.append("\n### ⚡ 能量体")
-        line = f"- 当前能量体：**{growth_value}**"
-        level_name = level.get("name")
-        if level_name:
-            line += f"（{level_name}）"
-        lines.append(line)
+    # --- 账户数值（Co积分余额 / 能量体 / 即将过期积分，含签到前后变化） ---
+    metric_lines = _account_metric_lines(result)
+    if metric_lines:
+        lines.append("\n### 💰 账户数值")
+        lines.extend("- " + line for line in metric_lines)
 
     # --- 签到任务进度 ---
     task_lines = _task_progress_lines(result.get("task_list"))
@@ -214,7 +244,7 @@ def build_feishu_card(result: dict, title: str = "领克App · 每日任务") ->
     """
     elements = []
 
-    # --- 签到区 ---
+    # --- 签到区（含账户数值的签到前后真实变化） ---
     sign_lines = []
     if result.get("already_signed"):
         sign_lines.append("ℹ️ **今日已签到**，无需重复签到")
@@ -228,6 +258,10 @@ def build_feishu_card(result: dict, title: str = "领克App · 每日任务") ->
                 sign_lines.append("本次奖励：" + " · ".join(parts))
         else:
             sign_lines.append("❌ **签到失败**：" + str(sign_result.get("message", "未知错误")))
+    metric_lines = _account_metric_lines(result)
+    if metric_lines:
+        sign_lines.append("")
+        sign_lines.extend(metric_lines)
     continue_data = (result.get("continue_info") or {}).get("data") or {}
     stats = []
     if continue_data.get("continueDays") is not None:
@@ -249,38 +283,6 @@ def build_feishu_card(result: dict, title: str = "领克App · 每日任务") ->
             detail = share_result.get("detail") or {}
             share_text = "🔗 分享任务：**失败**（" + str(detail.get("message", "详情见日志")) + "）"
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": share_text}})
-        elements.append({"tag": "hr"})
-
-    # --- 三列仪表盘：Co积分余额 / 能量体 / 即将过期积分 ---
-    columns = []
-    point_before = _extract_point(result.get("energy_before") or {})
-    point_after = _extract_point(result.get("energy_after") or {})
-    try:
-        delta = int(point_after) - int(point_before)
-        delta_str = f"（+{delta}）" if delta > 0 else (f"（{delta}）" if delta < 0 else "")
-    except (ValueError, TypeError):
-        delta_str = ""
-    columns.append(("Co积分余额", f"**{point_after}** {delta_str}".rstrip()))
-
-    growth_resp = result.get("energy_growth") or {}
-    level = (growth_resp.get("data") or {}).get("accountLevelVo") or {}
-    if level.get("growth") is not None:
-        growth_text = f"**{level['growth']}**"
-        if level.get("name"):
-            growth_text += f"（{level['name']}）"
-        columns.append(("能量体", growth_text))
-
-    expire_point = _extract_expire(result.get("energy_after") or {})
-    if expire_point != "?":
-        columns.append(("即将过期积分", f"**{expire_point}**"))
-
-    if columns:
-        column_elements = [
-            {"tag": "column", "elements": [
-                {"tag": "div", "text": {"tag": "lark_md", "content": f"{name}\n{value}"}}]}
-            for name, value in columns
-        ]
-        elements.append({"tag": "column_set", "columns": column_elements})
         elements.append({"tag": "hr"})
 
     # --- 签到任务进度 ---
