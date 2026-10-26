@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -26,6 +27,9 @@ from lynkco_common import env_value, load_env_data
 
 FEISHU_CONNECT_TIMEOUT = 5
 FEISHU_READ_TIMEOUT = 15
+
+# 推送文案统一使用北京时间：GitHub Actions runner 默认 UTC，直接 strftime 会早 8 小时。
+BEIJING_TZ = timezone(timedelta(hours=8))
 
 BARK_DEFAULT_BASE = "https://api.day.app"
 BARK_CONNECT_TIMEOUT = 5
@@ -158,6 +162,18 @@ def _token_remain_days(token_info: dict) -> str:
     return str(int(remain_sec // 86400))
 
 
+def _token_expire_date(token_info: dict) -> str:
+    """从 refreshExpireAt（毫秒纪元）取北京时间到期日期 YYYY-MM-DD，缺失/异常时返回空串。"""
+    refresh_expire_at = (token_info or {}).get("refreshExpireAt")
+    if not refresh_expire_at:
+        return ""
+    try:
+        expire_dt = datetime.fromtimestamp(float(refresh_expire_at) / 1000, BEIJING_TZ)
+    except (TypeError, ValueError, OSError):
+        return ""
+    return expire_dt.strftime("%Y-%m-%d")
+
+
 def build_markdown_report(result: dict) -> str:
     """把 lynkco_daily_tasks.run_daily_tasks() 返回的结果字典组装成推送文案。"""
     lines = []
@@ -213,10 +229,11 @@ def build_markdown_report(result: dict) -> str:
         lines.append("\n### 📋 签到任务进度")
         lines.extend(task_lines)
 
-    # --- refreshToken 剩余天数 ---
+    # --- refreshToken 到期日（本次续期签发的新 refreshToken） ---
     remain_days = _token_remain_days(result.get("token_info"))
-    if remain_days:
-        lines.append(f"\n> refreshToken 剩余 **{remain_days}** 天")
+    expire_date = _token_expire_date(result.get("token_info"))
+    if remain_days and expire_date:
+        lines.append(f"\n> refreshToken 有效期至 **{expire_date}**（剩余 **{remain_days}** 天，本次续期新签发）")
 
     return "\n".join(lines)
 
@@ -293,12 +310,13 @@ def build_feishu_card(result: dict, title: str = "领克App · 每日任务") ->
                                   "content": "📋 **签到任务进度**\n" + "\n".join(task_lines)}})
         elements.append({"tag": "hr"})
 
-    # --- 备注：refreshToken 剩余天数 + 推送时间 ---
+    # --- 备注：refreshToken 到期日 + 北京时间 ---
     note_parts = []
     remain_days = _token_remain_days(result.get("token_info"))
-    if remain_days:
-        note_parts.append(f"refreshToken 剩余 {remain_days} 天")
-    note_parts.append("推送时间 " + time.strftime("%Y-%m-%d %H:%M:%S"))
+    expire_date = _token_expire_date(result.get("token_info"))
+    if remain_days and expire_date:
+        note_parts.append(f"refreshToken 有效期至 {expire_date}（剩余 {remain_days} 天）")
+    note_parts.append("推送时间 " + datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S"))
     elements.append({"tag": "note",
                      "elements": [{"tag": "plain_text", "content": " · ".join(note_parts)}]})
 
