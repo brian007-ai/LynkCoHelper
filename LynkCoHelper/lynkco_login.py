@@ -14,11 +14,13 @@ docs/登录接口协议说明.md；签名密钥来源见 docs/AppSecret_逆向�
 统一入口 load_token()：按优先级自动选择上述方式，供 lynkco_sign.py /
 lynkco_share.py 等业务脚本直接调用。
 """
+import hashlib
 import json
 import os
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -373,6 +375,59 @@ _LAST_REFRESH_INFO: dict = {}
 def get_last_refresh_info() -> dict:
     """返回最近一次 refreshToken 续期的时间信息 {"expireAt", "refreshExpireAt"}的副本；未发生过续期（命中缓存 token/静态 token）时返回空字典。"""
     return dict(_LAST_REFRESH_INFO)
+
+
+# refreshToken 有效期按 30 天估算。注意：接口每次续期返回的 refreshExpireAt 是
+# “新签发 token”的 30 天有效期（每天都是 29~30 天），无法据此得知 Secret 里那个
+# 旧 token 还剩多久。因此另用缓存文件记录当前 Secret token 的指纹与首次观测日期，
+# 由 CI 的 actions/cache 跨运行保留，据此估算真实到期日并提前提醒。
+_TOKEN_META_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".token_meta.json")
+REFRESH_TOKEN_VALID_DAYS = 30
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def track_refresh_token_age() -> dict:
+    """记录并返回 Secret 中 refreshToken 的已用天数，供到期前提醒使用。
+
+    返回 {"age_days", "remain_days", "first_seen", "expire_date"}；未配置
+    LYNKCO_REFRESH_TOKEN 时返回空 dict。检测到换过新 token（指纹变化）时
+    自动把起点重置为今天。
+    """
+    current = (os.environ.get("LYNKCO_REFRESH_TOKEN") or "").strip()
+    if not current:
+        return {}
+
+    fingerprint = hashlib.sha256(current.encode("utf-8")).hexdigest()[:12]
+    today = datetime.now(_BEIJING_TZ).date()
+
+    meta = {}
+    if os.path.exists(_TOKEN_META_FILE):
+        try:
+            with open(_TOKEN_META_FILE, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+        except Exception:
+            meta = {}
+
+    if meta.get("fingerprint") != fingerprint or not meta.get("first_seen"):
+        meta = {"fingerprint": fingerprint, "first_seen": today.isoformat()}
+        try:
+            with open(_TOKEN_META_FILE, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+        except Exception:
+            pass
+
+    try:
+        first_seen = datetime.strptime(str(meta["first_seen"]), "%Y-%m-%d").date()
+    except (KeyError, TypeError, ValueError):
+        return {}
+
+    age_days = max((today - first_seen).days, 0)
+    return {
+        "age_days": age_days,
+        "remain_days": max(REFRESH_TOKEN_VALID_DAYS - age_days, 0),
+        "first_seen": first_seen.isoformat(),
+        "expire_date": (first_seen + timedelta(days=REFRESH_TOKEN_VALID_DAYS)).isoformat(),
+    }
 
 
 def _cached_token_valid(user_data: dict) -> str:

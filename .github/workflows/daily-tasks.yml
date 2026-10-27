@@ -4,6 +4,9 @@
 # 说明：
 #   - 登录环节存在滑块验证码，无法在 CI 中完全自动化，本工作流依赖
 #     refreshToken 自动续期获取 token（约30天有效，需定期人工更新）。
+#     接口每次续期返回的是新签发 token 的有效期，看不出 Secret 里旧 token
+#     还剩多久，因此用 actions/cache 跨运行保存首次观测日期，剩余不足 7 天
+#     时在推送卡片顶部显示警告（见 lynkco_login.track_refresh_token_age）。
 #   - LYNKCO_APP_SECRETS 是领克官方 App 的应用级共用签名密钥集合
 #     （非个人账号凭证），一个 JSON 字符串 Secret 整合以下 4 个独立字段，
 #     必须配置，否则脚本无法计算请求签名。
@@ -57,6 +60,16 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         if [ -f ./LynkCoHelper/requirements.txt ]; then pip install -r ./LynkCoHelper/requirements.txt; fi
+    - name: Restore refreshToken age cache
+      # runner 是一次性的，普通文件跨运行留不住；这里用 cache 保存
+      # .token_meta.json（只含 token 指纹与首次观测日期，不含 token 本身），
+      # 供脚本估算 Secret 中 refreshToken 的真实到期日。
+      uses: actions/cache/restore@v4
+      with:
+        path: LynkCoHelper/.token_meta.json
+        key: token-meta-${{ github.run_id }}
+        restore-keys: |
+          token-meta-
     - name: Run sign-in and notify (attempt 1)
       id: run1
       continue-on-error: true
@@ -74,6 +87,13 @@ jobs:
       continue-on-error: true
       run: |
         python ./LynkCoHelper/lynkco_daily_tasks.py
+    - name: Save refreshToken age cache
+      # 无论任务成败都保存（续期可能已发生），key 用 run_id 保证每次都能写入。
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: LynkCoHelper/.token_meta.json
+        key: token-meta-${{ github.run_id }}
     - name: Alert failure to Feishu
       # 三次均失败才告警；本步骤失败（如飞书不可达）不影响 job 结论。
       if: steps.run3.outcome == 'failure'

@@ -16,7 +16,7 @@ import sys
 import time
 
 from lynkco_common import env_value, mask_sensitive
-from lynkco_login import load_token, get_last_refresh_info
+from lynkco_login import load_token, get_last_refresh_info, track_refresh_token_age
 from lynkco_notify import build_markdown_report, build_feishu_card, send_feishu_notification
 from lynkco_sign import LynkCoSignClient
 from lynkco_share import LynkCoShareClient
@@ -128,13 +128,17 @@ def run_and_notify() -> dict:
     返回值同 run_daily_tasks()，并额外附带 "notify_result" 字段（飞书
     推送接口的响应，或 {"skipped": True}）。
     """
+    # 先记录 Secret 中 refreshToken 的已用天数（写 .token_meta.json，由 CI 的
+    # actions/cache 跨运行保留）；即使后续续期失败也能留下记录，供到期提醒使用。
+    token_age = track_refresh_token_age()
     token = load_token()
 
     print("=== 执行每日任务（签到+分享）===")
     result = run_daily_tasks(token, do_share=True)
-    # CI 每次运行都会用 refreshToken 续期，此处 附上续期返回的过期时间，
-    # 供推送卡片展示 refreshToken 剩余天数；命中缓存 token 时为空字典。
+    # 续期返回的是“新签发 token”的过期时间，仅用于排查，不用于到期提醒。
     result["token_info"] = get_last_refresh_info()
+    # Secret 里旧 token 的使用天数/预计到期日，用于卡片到期前提醒。
+    result["token_age"] = token_age
     print(json.dumps(mask_sensitive(result), ensure_ascii=False, indent=2))
 
     markdown_body = build_markdown_report(result)

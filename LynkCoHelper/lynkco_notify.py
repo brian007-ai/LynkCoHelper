@@ -148,30 +148,32 @@ def _task_progress_lines(task_resp) -> list:
     return lines
 
 
-def _token_remain_days(token_info: dict) -> str:
-    """从续期信息的 refreshExpireAt（毫秒纪元）计算 refreshToken 剩余天数，缺失/异常时返回空串。"""
-    refresh_expire_at = (token_info or {}).get("refreshExpireAt")
-    if not refresh_expire_at:
-        return ""
-    try:
-        remain_sec = float(refresh_expire_at) / 1000 - time.time()
-    except (TypeError, ValueError):
-        return ""
-    if remain_sec <= 0:
-        return "0"
-    return str(int(remain_sec // 86400))
+TOKEN_EXPIRE_WARN_DAYS = 7
 
 
-def _token_expire_date(token_info: dict) -> str:
-    """从 refreshExpireAt（毫秒纪元）取北京时间到期日期 YYYY-MM-DD，缺失/异常时返回空串。"""
-    refresh_expire_at = (token_info or {}).get("refreshExpireAt")
-    if not refresh_expire_at:
+def _token_age_warning(result: dict) -> list:
+    """refreshToken 到期提醒正文；剩余天数 > 7 时返回空列表（不打扰）。"""
+    age = result.get("token_age") or {}
+    remain = age.get("remain_days")
+    if remain is None:
+        return []
+    if remain <= 0:
+        return ["🚨 **Secret 里的 refreshToken 已到期**，若不更新 LYNKCO_REFRESH_TOKEN，"
+                "下次运行将无法续期、签到会中断。"]
+    if remain <= TOKEN_EXPIRE_WARN_DAYS:
+        return [f"⚠️ **refreshToken 将在 {remain} 天后到期**（{age.get('expire_date')}），"
+                "请及时到仓库 Secrets 更新 LYNKCO_REFRESH_TOKEN。"]
+    return []
+
+
+def _token_age_note(result: dict) -> str:
+    """refreshToken 使用情况文案，未启用跟踪时返回空串。"""
+    age = result.get("token_age") or {}
+    remain = age.get("remain_days")
+    if remain is None:
         return ""
-    try:
-        expire_dt = datetime.fromtimestamp(float(refresh_expire_at) / 1000, BEIJING_TZ)
-    except (TypeError, ValueError, OSError):
-        return ""
-    return expire_dt.strftime("%Y-%m-%d")
+    return (f"refreshToken 已用 {age.get('age_days', 0)} 天"
+            f"（预计 {age.get('expire_date')} 到期，还剩 {remain} 天）")
 
 
 def build_markdown_report(result: dict) -> str:
@@ -229,25 +231,31 @@ def build_markdown_report(result: dict) -> str:
         lines.append("\n### 📋 签到任务进度")
         lines.extend(task_lines)
 
-    # --- refreshToken 到期日（本次续期签发的新 refreshToken） ---
-    remain_days = _token_remain_days(result.get("token_info"))
-    expire_date = _token_expire_date(result.get("token_info"))
-    if remain_days and expire_date:
-        lines.append(f"\n> refreshToken 有效期至 **{expire_date}**（剩余 **{remain_days}** 天，本次续期新签发）")
+    # --- refreshToken 使用天数（跟踪的是 Secret 里的旧 token，不是本次续期新签发的） ---
+    token_note = _token_age_note(result)
+    if token_note:
+        lines.append(f"\n> {token_note}")
+    for warning in _token_age_warning(result):
+        lines.append(f"\n> {warning}")
 
     return "\n".join(lines)
 
 
 def _card_header_template(result: dict) -> str:
-    """按任务结果挑选卡片 header 颜色：签到失败红、分享失败黄、已签到蓝、全部成功绿。"""
+    """按任务结果挑选卡片 header 颜色：签到失败/已到期红、分享失败或即将到期橙、已签到蓝、全部成功绿。"""
     sign_result = result.get("sign_result") or {}
     sign_failed = (not result.get("already_signed")) and not sign_result.get("success")
     share_result = result.get("share_result")
     share_failed = share_result is not None and not share_result.get("ok")
+    remain_days = (result.get("token_age") or {}).get("remain_days")
     if sign_failed:
+        return "red"
+    if remain_days is not None and remain_days <= 0:
         return "red"
     if share_failed:
         return "yellow"
+    if remain_days is not None and remain_days <= TOKEN_EXPIRE_WARN_DAYS:
+        return "orange"
     if result.get("already_signed"):
         return "blue"
     return "green"
@@ -260,6 +268,11 @@ def build_feishu_card(result: dict, title: str = "领克App · 每日任务") ->
     webhook 的 payload。
     """
     elements = []
+
+    # --- refreshToken 到期提醒（剩余 ≤7 天或已到期时置顶展示） ---
+    for warning in _token_age_warning(result):
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": warning}})
+        elements.append({"tag": "hr"})
 
     # --- 签到区（含账户数值的签到前后真实变化） ---
     sign_lines = []
@@ -310,12 +323,11 @@ def build_feishu_card(result: dict, title: str = "领克App · 每日任务") ->
                                   "content": "📋 **签到任务进度**\n" + "\n".join(task_lines)}})
         elements.append({"tag": "hr"})
 
-    # --- 备注：refreshToken 到期日 + 北京时间 ---
+    # --- 备注：refreshToken 使用天数 + 北京时间 ---
     note_parts = []
-    remain_days = _token_remain_days(result.get("token_info"))
-    expire_date = _token_expire_date(result.get("token_info"))
-    if remain_days and expire_date:
-        note_parts.append(f"refreshToken 有效期至 {expire_date}（剩余 {remain_days} 天）")
+    token_note = _token_age_note(result)
+    if token_note:
+        note_parts.append(token_note)
     note_parts.append("推送时间 " + datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S"))
     elements.append({"tag": "note",
                      "elements": [{"tag": "plain_text", "content": " · ".join(note_parts)}]})
