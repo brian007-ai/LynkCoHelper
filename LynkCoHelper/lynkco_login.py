@@ -384,6 +384,10 @@ def get_last_refresh_info() -> dict:
 _TOKEN_META_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".token_meta.json")
 REFRESH_TOKEN_VALID_DAYS = 30
 _BEIJING_TZ = timezone(timedelta(hours=8))
+# 首次启用跟踪时（还没有 .token_meta.json）的起始日期，取仓库 Secrets 页面
+# LYNKCO_REFRESH_TOKEN 显示的更新日期，避免第一轮少算已用天数。只在无缓存
+# 记录时使用一次；之后一律以 .token_meta.json 为准，换 token 时自动重置。
+_TOKEN_FIRST_SEEN_SEED = "2026-10-23"
 
 
 def track_refresh_token_age() -> dict:
@@ -409,7 +413,13 @@ def track_refresh_token_age() -> dict:
             meta = {}
 
     if meta.get("fingerprint") != fingerprint or not meta.get("first_seen"):
-        meta = {"fingerprint": fingerprint, "first_seen": today.isoformat()}
+        first_seen = today
+        if not meta and _TOKEN_FIRST_SEEN_SEED:
+            try:
+                first_seen = datetime.strptime(_TOKEN_FIRST_SEEN_SEED, "%Y-%m-%d").date()
+            except ValueError:
+                first_seen = today
+        meta = {"fingerprint": fingerprint, "first_seen": first_seen.isoformat()}
         try:
             with open(_TOKEN_META_FILE, "w", encoding="utf-8") as f:
                 json.dump(meta, f)
