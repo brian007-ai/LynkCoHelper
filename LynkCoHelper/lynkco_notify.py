@@ -94,23 +94,36 @@ def _account_metric_lines(result: dict) -> list:
     return lines
 
 
-def _sign_reward_parts(sign_data: dict) -> list:
+def _fmt_delta(value: int) -> str:
+    """增量带符号显示：+5 / -3 / 0。"""
+    return f"+{value}" if value >= 0 else str(value)
+
+
+def _measured_delta_line(result: dict) -> str:
     """
-    签到奖励细分（字段名来自领克签到响应，参考 yujiejobs/lynk_sign_docker）：
-    rewardEnergyNumber 是 Co积分（经用户确认）、rewardSignCardNumber 是补签卡；
-    rewardPointNumber 的准确含义待真实响应确认，先用中性标签"积分"兜底。
+    本次运行前后的真实变化（Co积分 / 能量体）。
+
+    签到响应里的 rewardEnergyNumber / rewardPointNumber 与实际变化对不上
+    （2026-10-29 实测：字段为 1，Co积分实增 5、能量体实增 3），因此不再引用
+    这些含义不明的字段，改用签到前后两次查询的差值，保证数字真实。
     """
+    if result.get("already_signed") or result.get("sign_result") is None:
+        return ""
+
     parts = []
-    reward_energy = sign_data.get("rewardEnergyNumber")
-    if reward_energy is not None:
-        parts.append(f"Co积分 **+{reward_energy}**")
-    reward_point = sign_data.get("rewardPointNumber")
-    if reward_point is not None:
-        parts.append(f"积分 **+{reward_point}**")
-    reward_card = sign_data.get("rewardSignCardNumber")
-    if reward_card is not None:
-        parts.append(f"补签卡 **+{reward_card}**")
-    return parts
+    point_before = _extract_point(result.get("energy_before") or {})
+    point_after = _extract_point(result.get("energy_after") or {})
+    if point_before.isdigit() and point_after.isdigit():
+        parts.append(f"Co积分 **{_fmt_delta(int(point_after) - int(point_before))}**")
+
+    growth_before, _ = _extract_growth(result.get("energy_growth_before"))
+    growth_after, _ = _extract_growth(result.get("energy_growth"))
+    if growth_before is not None and growth_after is not None:
+        parts.append(f"能量体 **{_fmt_delta(growth_after - growth_before)}**")
+
+    if not parts:
+        return ""
+    return "本次变化：" + " · ".join(parts)
 
 
 def _task_progress_lines(task_resp) -> list:
@@ -187,12 +200,11 @@ def build_markdown_report(result: dict) -> str:
     else:
         sign_result = result.get("sign_result") or {}
         sign_ok = bool(sign_result.get("success"))
-        sign_data = sign_result.get("data") or {}
         if sign_ok:
             lines.append("### ✅ 签到成功")
-            parts = _sign_reward_parts(sign_data)
-            if parts:
-                lines.append("- 本次奖励：" + " · ".join(parts))
+            delta_line = _measured_delta_line(result)
+            if delta_line:
+                lines.append("- " + delta_line.replace("**", ""))
         else:
             lines.append("### ❌ 签到失败")
             lines.append(f"- {sign_result.get('message', '未知错误')}")
@@ -241,6 +253,15 @@ def build_markdown_report(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _card_title(result: dict) -> str:
+    """卡片标题直接用签到状态，替代固定的「领克App · 每日任务」。"""
+    if result.get("already_signed"):
+        return "今日已签到"
+    if result.get("sign_result") is None:
+        return "每日任务"
+    return "签到成功" if (result.get("sign_result") or {}).get("success") else "签到失败"
+
+
 def _card_header_template(result: dict) -> str:
     """按任务结果挑选卡片 header 颜色：签到失败/已到期红、分享失败或即将到期橙、已签到蓝、全部成功绿。"""
     sign_result = result.get("sign_result") or {}
@@ -261,11 +282,10 @@ def _card_header_template(result: dict) -> str:
     return "green"
 
 
-def build_feishu_card(result: dict, title: str = "领克App · 每日任务") -> dict:
+def build_feishu_card(result: dict) -> dict:
     """
-    把任务结果组装成飞书 interactive 卡片消息体（含 header 变色、分区块
-    div、三列仪表盘 column_set 与 note 备注），返回值可直接作为飞书
-    webhook 的 payload。
+    把任务结果组装成飞书 interactive 卡片消息体（header 标题即签到状态、
+    按结果变色，分区块 div、note 备注），返回值可直接作为 webhook payload。
     """
     elements = []
 
@@ -274,23 +294,20 @@ def build_feishu_card(result: dict, title: str = "领克App · 每日任务") ->
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": warning}})
         elements.append({"tag": "hr"})
 
-    # --- 签到区（含账户数值的签到前后真实变化） ---
+    # --- 签到区（状态在卡片标题，这里只放细节：变化 / 失败原因 / 账户数值） ---
     sign_lines = []
-    if result.get("already_signed"):
-        sign_lines.append("ℹ️ **今日已签到**，无需重复签到")
-    else:
+    if not result.get("already_signed"):
         sign_result = result.get("sign_result") or {}
-        sign_data = sign_result.get("data") or {}
         if sign_result.get("success"):
-            sign_lines.append("✅ **签到成功**")
-            parts = _sign_reward_parts(sign_data)
-            if parts:
-                sign_lines.append("本次奖励：" + " · ".join(parts))
+            delta_line = _measured_delta_line(result)
+            if delta_line:
+                sign_lines.append(delta_line)
         else:
-            sign_lines.append("❌ **签到失败**：" + str(sign_result.get("message", "未知错误")))
+            sign_lines.append("原因：" + str(sign_result.get("message", "未知错误")))
     metric_lines = _account_metric_lines(result)
     if metric_lines:
-        sign_lines.append("")
+        if sign_lines:
+            sign_lines.append("")
         sign_lines.extend(metric_lines)
     continue_data = (result.get("continue_info") or {}).get("data") or {}
     stats = []
@@ -300,8 +317,9 @@ def build_feishu_card(result: dict, title: str = "领克App · 每日任务") ->
         stats.append(f"补签卡 **{continue_data['signCardNumber']} 张**")
     if stats:
         sign_lines.append(" · ".join(stats))
-    elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(sign_lines)}})
-    elements.append({"tag": "hr"})
+    if sign_lines:
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(sign_lines)}})
+        elements.append({"tag": "hr"})
 
     # --- 分享区 ---
     share_result = result.get("share_result")
@@ -336,7 +354,7 @@ def build_feishu_card(result: dict, title: str = "领克App · 每日任务") ->
         "msg_type": "interactive",
         "card": {
             "header": {
-                "title": {"tag": "plain_text", "content": title},
+                "title": {"tag": "plain_text", "content": _card_title(result)},
                 "template": _card_header_template(result),
             },
             "elements": elements,
